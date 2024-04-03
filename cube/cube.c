@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdbool.h>
 #include <assert.h>
@@ -317,6 +318,8 @@ struct demo {
     xcb_screen_t *screen;
     xcb_window_t xcb_window;
     xcb_intern_atom_reply_t *atom_wm_delete_window;
+    xcb_window_t child_windows[2];
+    uint8_t child_window_flags;
 #elif defined(VK_USE_PLATFORM_WAYLAND_KHR)
     struct wl_display *display;
     struct wl_registry *registry;
@@ -2718,6 +2721,56 @@ static void demo_run_xlib(struct demo *demo) {
     }
 }
 #elif defined(VK_USE_PLATFORM_XCB_KHR)
+	#define NO_OP_CHILD_WINDOW 0u
+    #define ADD_CHILD_WINDOW 1u
+    #define RM_CHILD_WINDOW 2u
+
+static inline uint8_t get_child_window_op(const uint8_t child_window_flags) {
+	return ( (child_window_flags) & 0b00000011 );
+}
+static inline uint8_t get_num_child_windows(const uint8_t child_window_flags) {
+	return ( (child_window_flags) >> 2 );
+}
+
+static inline uint8_t xcb_flag_window_add(const uint8_t xcb_flag) {
+	return (xcb_flag & 0b11111100) | ADD_CHILD_WINDOW;
+}
+static inline uint8_t xcb_flag_window_rem(const uint8_t xcb_flag) {
+	return (xcb_flag & 0b11111100) | RM_CHILD_WINDOW;
+}
+
+static uint8_t set_num_child_windows(const uint8_t num_child_windows) {
+	return num_child_windows << 2;
+}
+
+static void demo_create_xcb_child_window(struct demo *demo, const uint8_t child_window_index) {
+    uint32_t value_mask, value_list[32];
+
+    demo->child_windows[child_window_index] = xcb_generate_id(demo->connection);
+
+    value_mask = XCB_CW_BACK_PIXMAP;
+    value_list[0] = XCB_BACK_PIXMAP_PARENT_RELATIVE;
+
+    xcb_create_window(demo->connection, XCB_COPY_FROM_PARENT, demo->child_windows[child_window_index], demo->xcb_window, 0, 0, 10, 10,
+                      0, XCB_WINDOW_CLASS_INPUT_OUTPUT, XCB_COPY_FROM_PARENT, value_mask, value_list);
+
+    xcb_map_window(demo->connection, demo->child_windows[child_window_index]);
+}
+
+static inline void xcb_add_or_rem_window(struct demo *demo) {
+	const uint8_t child_window_flags = demo->child_window_flags;
+	const uint8_t num_windows = get_num_child_windows(child_window_flags);
+	const uint8_t window_op = get_child_window_op(child_window_flags);
+	if (window_op == ADD_CHILD_WINDOW && num_windows < 2) {
+		demo_create_xcb_child_window(demo, num_windows);
+		demo->child_window_flags = set_num_child_windows(num_windows+1u);
+	} else if (window_op == RM_CHILD_WINDOW && num_windows > 0) {
+		xcb_unmap_window(demo->connection, demo->child_windows[num_windows-1u]);
+		xcb_destroy_window(demo->connection, demo->child_windows[num_windows-1u]);
+		demo->child_window_flags = set_num_child_windows(num_windows-1u);
+		demo->child_windows[num_windows-1u] = 0;
+	}
+}
 static void demo_handle_xcb_event(struct demo *demo, const xcb_generic_event_t *event) {
     uint8_t event_code = event->response_type & 0x7f;
     switch (event_code) {
@@ -2745,16 +2798,22 @@ static void demo_handle_xcb_event(struct demo *demo, const xcb_generic_event_t *
                 case 0x41:  // space bar
                     demo->pause = !demo->pause;
                     break;
+                case 0x19: //w
+                	demo->child_window_flags = xcb_flag_window_add(demo->child_window_flags);
+                	break;
+                case 0x35: //x
+                	demo->child_window_flags = xcb_flag_window_rem(demo->child_window_flags);
+                	break;
             }
         } break;
-        case XCB_CONFIGURE_NOTIFY: {
+        /*case XCB_CONFIGURE_NOTIFY: {
             const xcb_configure_notify_event_t *cfg = (const xcb_configure_notify_event_t *)event;
             if ((demo->width != cfg->width) || (demo->height != cfg->height)) {
                 demo->width = cfg->width;
                 demo->height = cfg->height;
                 demo_resize(demo);
             }
-        } break;
+        } break;*/
         default:
             break;
     }
@@ -2769,6 +2828,7 @@ static void demo_run_xcb(struct demo *demo) {
         if (demo->pause) {
             event = xcb_wait_for_event(demo->connection);
         } else {
+        	xcb_add_or_rem_window(demo);
             event = xcb_poll_for_event(demo->connection);
         }
         while (event) {
